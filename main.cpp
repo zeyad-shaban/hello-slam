@@ -1,83 +1,82 @@
-#include <cmath>
+#include <Eigen/Core>
+#include <Eigen/Eigen>
+#include <fstream>
 #include <iostream>
-#include <opencv2/core/matx.hpp>
-#include <opencv2/highgui.hpp>
+#include <opencv2/calib3d.hpp>
 #include <opencv2/opencv.hpp>
 
 int main() {
-  cv::Mat img = cv::imread("C:/Users/zeyad/Desktop/2_Projects/1Active/"
-                           "slam_book_follow/data/distorted.png");
-  if (img.empty()) {
-    std::cout << "image is empty, perhaps invalid path" << std::endl;
+  auto left_img = cv::imread("C:/Users/zeyad/Desktop/2_Projects/1Active/"
+                             "slam_book_follow/data/left.png", 0);
+  auto right_img = cv::imread("C:/Users/zeyad/Desktop/2_Projects/1Active/"
+                              "slam_book_follow/data/right.png", 0);
+  if (left_img.empty() || right_img.empty()) {
+    std::cout << "either left_img {" << left_img.empty() << "} or right_img {"
+              << right_img.empty() << "} was not found" << std::endl;
     return 1;
   }
+  std::cout << left_img.rows << " x " << left_img.cols << " x "
+            << left_img.channels() << std::endl;
+  std::cout << right_img.rows << " x " << right_img.cols << " x "
+            << right_img.channels() << std::endl;
 
-  std::cout << "image shape: " << img.rows << ", " << img.cols << ", "
-            << img.channels() << std::endl;
-
-  cv::Mat img_undist(img.rows, img.cols, img.type());
-  
-  std::cout << "undistorted img shape: " << img_undist.rows << ", " << img_undist.cols << ", "
-            << img_undist.channels() << std::endl;
-
-  // rad−tan model params
-  double k1 = -0.28340811, k2 = 0.07395907, p1 = 0.00019359,
-         p2 = 1.76187114e-05;
   double fx = 718.856, fy = 718.856, cx = 607.1928, cy = 185.2157;
+  double b = 0.573;
 
-  // Get location of distortion
-  for (int v = 0; v < img.rows; ++v) {
-    auto undist_row_ptr = img_undist.ptr<cv::Vec3b>(v);
+  cv::Ptr<cv::StereoSGBM> sgbm = cv::StereoSGBM::create(
+      0, 150, 5, 8 * 1 * 5 * 5, 32 * 1 * 5 * 5, 1, 61, 10, 100, 32);
+  cv::Mat disparity_sgbm, disparity;
+  sgbm->compute(left_img, right_img, disparity_sgbm);
+  disparity_sgbm.convertTo(disparity, CV_32FC1, 1.0f / 16.0f);
 
-    for (int u = 0; u < img.cols; ++u) {
-      double x = (u - cx) / fx;
+  std::vector<Eigen::Vector4d> point_cloud;
+  point_cloud.reserve(left_img.cols * left_img.rows);
+
+  for (int v = 0; v < left_img.rows; v++) {
+    auto disparity_row = disparity.ptr<float>(v);
+    for (int u = 0; u < left_img.cols; u++) {
+      double d = disparity_row[u];
+      if (d <= 0)
+        continue;
+
+      double Z = (fx * b) / d;
+
+      double x = (u - cx) / fx; // u = fx x + cx
       double y = (v - cy) / fy;
 
-      double r = std::sqrt(x * x + y * y);
-      double radial_err_scale = 1 + k1 * std::pow(r, 2) + k2 * std::pow(r, 4);
-
-      double x_dist =
-          x * (radial_err_scale) + 2 * p1 * x * y + p2 * (r * r + 2 * x * x);
-      double y_dist =
-          y * (radial_err_scale) + 2 * p2 * x * y + p1 * (r * r + 2 * y * y);
-
-      double u_dist = fx * x_dist + cx;
-      double v_dist = fy * y_dist + cy;
-
-      // Bilinear Interpolation
-      int u_int = std::floor(u_dist);
-      int v_int = std::floor(v_dist);
-      double du = u_dist - u_int;
-      double dv = v_dist - v_int;
-
-      if (u_int < 0 || u_int >= img.cols || v_int < 0 || v_int >= img.rows) {
-        std::cout << "out of range: u dist: " << u_dist << " v_dist: " << v_dist
-                  << "\n";
-        undist_row_ptr[u] = cv::Vec3b(0, 0, 0);
-        continue;
-      }
-
-      int u_next = std::min(u_int + 1, img_undist.cols - 1);
-      int v_next = std::min(v_int + 1, img_undist.rows - 1);
-      
-      if (u_next != u_int + 1 || v_next != v_int + 1) {
-        std::cout << "bruh" << std::endl;
-      }
-
-      auto p00 = img.ptr<cv::Vec3b>(v_int)[u_next];
-      auto p01 = img.ptr<cv::Vec3b>(v_int)[u_next];
-      auto p10 = img.ptr<cv::Vec3b>(v_next)[u_int];
-      auto p11 = img.ptr<cv::Vec3b>(v_next)[u_next];
-
-      undist_row_ptr[u] = p00 * (1 - du) * (1 - dv) + p01 * du * (1 - dv) +
-                          p10 * (1 - du) * dv + p11 * du * dv;
+      double X = Z * x;
+      double Y = Z * y;
+      point_cloud.push_back(Eigen::Vector4d(X, Y, Z, left_img.ptr<uchar>(v)[u]));
     }
   }
 
-  cv::imshow("distorted", img);
-  cv::imshow("undistorted", img_undist);
-
+  cv::imshow("disparity", disparity / 32);
   cv::waitKey(0);
+
+  std::ofstream out("_pointcloud.ply");
+
+  // 1. Write the PLY file header (Geometry + Blue Color)
+  out << "ply\n";
+  out << "format ascii 1.0\n";
+  out << "element vertex " << point_cloud.size() << "\n";
+  out << "property float x\n";
+  out << "property float y\n";
+  out << "property float z\n";
+  out << "property uchar red\n";
+  out << "property uchar green\n";
+  out << "property uchar blue\n";
+  out << "end_header\n";
+
+  // 2. Write the X, Y, Z coordinates and RGB values
+  for (const auto &p : point_cloud) {
+    int color = static_cast<int>(p[3]);
+    if (p[2] >= 50)
+      continue;
+    out << p[0] << " " << p[1] << " " << p[2] << " " << color << " " << color << " " << color << "\n";
+  };
+
+  out.close();
+  std::cout << "Done exporting point cloud" << std::endl;
 
   return 0;
 }

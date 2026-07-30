@@ -13,7 +13,5 @@ add_executable(main main.cpp)
 target_link_libraries(main PRIVATE
     Eigen3::Eigen
             Sophus::Sophus
-    opencv_core
-    opencv_imgproc
-    opencv_highgui
+    ${OpenCV_LIBS}
 )
