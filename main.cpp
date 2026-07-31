@@ -36,7 +36,10 @@ int main() {
   std::vector<Eigen::Vector4d> point_cloud;
   point_cloud.reserve(left_img.cols * left_img.rows);
 
-  auto t1 = std::chrono::steady_clock::now(); // this loop takes 4ms to complete, 250 fps a python developer would never dream off.. ehm sorry
+  auto t1 =
+      std::chrono::steady_clock::now(); // this loop takes 4ms to complete, 250
+                                        // fps a python developer would never
+                                        // dream off.. ehm sorry
   for (int v = 0; v < left_img.rows; v++) {
     auto disparity_row = disparity.ptr<float>(v);
     for (int u = 0; u < left_img.cols; u++) {
@@ -59,6 +62,13 @@ int main() {
   std::cout << "time took: "
             << std::chrono::duration<double, std::milli>(t2 - t1).count()
             << std::endl;
+
+  cv::Mat disparity_vis;
+  cv::normalize(disparity, disparity_vis, 0, 255, cv::NORM_MINMAX, CV_8U);
+
+  if (!cv::imwrite("./disparity_map.png", disparity_vis)) {
+    std::cout << "imwrite failed\n";
+  }
 
   // cv::imshow("disparity", disparity / 32);
   // cv::waitKey(0);
