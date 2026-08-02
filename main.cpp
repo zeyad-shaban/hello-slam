@@ -1,103 +1,133 @@
-#include <Eigen/Core>
 #include <Eigen/Eigen>
+#include <Eigen/Geometry>
 #include <chrono>
 #include <fstream>
 #include <iostream>
-#include <opencv2/calib3d.hpp>
+#include <opencv2/core/matx.hpp>
+#include <opencv2/core/utils/logger.defines.hpp>
+#include <opencv2/core/utils/logger.hpp>
+#include <opencv2/imgcodecs.hpp>
 #include <opencv2/opencv.hpp>
-#include <ratio>
+#include <ostream>
+#include <sophus/se3.hpp>
+#include <sophus/so3.hpp>
+#include <sstream>
+#include <string>
 
 int main() {
-  auto left_img = cv::imread("C:/Users/zeyad/Desktop/2_Projects/1Active/"
-                             "slam_book_follow/data/left.png",
-                             0);
-  auto right_img = cv::imread("C:/Users/zeyad/Desktop/2_Projects/1Active/"
-                              "slam_book_follow/data/right.png",
-                              0);
-  if (left_img.empty() || right_img.empty()) {
-    std::cout << "either left_img {" << left_img.empty() << "} or right_img {"
-              << right_img.empty() << "} was not found" << std::endl;
+  cv::utils::logging::setLogLevel(cv::utils::logging::LOG_LEVEL_WARNING);
+  const int N_IMAGES = 5;
+
+  const std::string data_path =
+      "C:/Users/zeyad/Desktop/2_Projects/1Active/slam_book_follow/data";
+
+  std::ifstream pose_stream(data_path + "/rgbd_pose.txt");
+  if (!pose_stream.is_open()) {
+    std::cerr << "no pose file found" << std::endl;
     return 1;
   }
-  std::cout << left_img.rows << " x " << left_img.cols << " x "
-            << left_img.channels() << std::endl;
-  std::cout << right_img.rows << " x " << right_img.cols << " x "
-            << right_img.channels() << std::endl;
 
-  double fx = 718.856, fy = 718.856, cx = 607.1928, cy = 185.2157;
-  double b = 0.573;
+  std::string line;
+  std::getline(pose_stream, line);
 
-  cv::Ptr<cv::StereoSGBM> sgbm = cv::StereoSGBM::create(
-      0, 150, 5, 8 * 1 * 5 * 5, 32 * 1 * 5 * 5, 1, 61, 10, 100, 32);
-  cv::Mat disparity_sgbm, disparity;
-  sgbm->compute(left_img, right_img, disparity_sgbm);
-  disparity_sgbm.convertTo(disparity, CV_32FC1, 1.0f / 16.0f);
+  std::vector<Sophus::SE3d> pose_vec;
+  // performance_try: count lines first and reserve required amount in advanced
+  // performance_try: dont' allocate quaternion and vector3d t, just put them
+  // directly performance_try: use push_back instead of embrace_back
 
-  std::vector<Eigen::Vector4d> point_cloud;
-  point_cloud.reserve(left_img.cols * left_img.rows);
+  std::vector<double> temp_pose_vec(7);
 
-  auto t1 =
-      std::chrono::steady_clock::now(); // this loop takes 4ms to complete, 250
-                                        // fps a python developer would never
-                                        // dream off.. ehm sorry
-  for (int v = 0; v < left_img.rows; v++) {
-    auto disparity_row = disparity.ptr<float>(v);
-    for (int u = 0; u < left_img.cols; u++) {
-      double d = disparity_row[u];
-      if (d <= 0)
-        continue;
+  while (std::getline(pose_stream, line)) {
+    std::stringstream streamed_str(line);
+    std::string val;
 
-      double Z = (fx * b) / d;
+    int i = -1;
+    while (std::getline(streamed_str, val, ' '))
+      temp_pose_vec[++i] = std::stod(val);
 
-      double x = (u - cx) / fx; // u = fx x + cx
-      double y = (v - cy) / fy;
+    const Eigen::Quaternion q(temp_pose_vec[6], temp_pose_vec[3],
+                              temp_pose_vec[4], temp_pose_vec[5]);
+    const Eigen::Vector3d t(temp_pose_vec[0], temp_pose_vec[1],
+                            temp_pose_vec[2]);
+    pose_vec.emplace_back(q, t);
+  }
 
-      double X = Z * x;
-      double Y = Z * y;
-      point_cloud.push_back(
-          Eigen::Vector4d(X, Y, Z, left_img.ptr<uchar>(v)[u]));
+  std::vector<cv::Mat> rgb_images;
+  std::vector<cv::Mat> depth_images;
+
+  for (size_t i = 1; i < N_IMAGES + 1; ++i) {
+    rgb_images.push_back(
+        cv::imread(data_path + "/rgbd_color/" + std::to_string(i) + ".png",
+                   cv::IMREAD_COLOR));
+
+    depth_images.push_back(
+        cv::imread(data_path + "/rgbd_depth/" + std::to_string(i) + ".pgm",
+                   cv::IMREAD_UNCHANGED));
+  }
+
+  double cx = 325.5;
+  double cy = 253.5;
+  double fx = 518.0;
+  double fy = 519.0;
+
+  // todo performance try reserving in advanced cols * rows * N_IMAGES
+  std::vector<Eigen::Matrix<double, 6, 1>> pointcloud;
+
+  for (size_t i = 0; i < N_IMAGES; ++i) {
+    const auto depth_img = depth_images[i];
+    const auto rgb_img = rgb_images[i];
+
+    // todo performace try not allocating the row ptr
+    // tood perforamnce try allocate matrix and move it instead of emblace
+    for (size_t v = 0; v < rgb_img.rows; ++v) {
+      const cv::Vec3b *row_ptr = rgb_img.ptr<cv::Vec3b>(v);
+      const ushort *depth_row = depth_img.ptr<ushort>(v);
+
+      for (size_t u = 0; u < rgb_img.cols; ++u) {
+        double Z_cam = depth_row[u] / 1000.0f; // mm
+        if (Z_cam <= 0)
+          continue;
+
+        double X_cam = Z_cam * (u - cx) / fx;
+        double Y_cam = Z_cam * (v - cy) / fy;
+        Eigen::Vector3d p_cam(X_cam, Y_cam, Z_cam);
+        Eigen::Vector3d p_world = pose_vec[i] * p_cam;
+
+        pointcloud.emplace_back(p_world[0], p_world[1], p_world[2],
+                                row_ptr[u][0], row_ptr[u][1], row_ptr[u][2]);
+      }
     }
   }
-  auto t2 = std::chrono::steady_clock::now();
-  std::cout << "time took: "
-            << std::chrono::duration<double, std::milli>(t2 - t1).count()
-            << std::endl;
 
-  cv::Mat disparity_vis;
-  cv::normalize(disparity, disparity_vis, 0, 255, cv::NORM_MINMAX, CV_8U);
-
-  if (!cv::imwrite("./disparity_map.png", disparity_vis)) {
-    std::cout << "imwrite failed\n";
+  // Save PLY format
+  std::cout << "Starting exporting PLY format..." << std::endl;
+  std::ofstream out(data_path + "/created/pointcloud_rgbd.ply");
+  if (!out.is_open()) {
+    std::cerr << "failed to open .ply file to write pointcloud" << std::endl;
+    return 1;
   }
 
-  // cv::imshow("disparity", disparity / 32);
-  // cv::waitKey(0);
+  out << "ply\n";
+  out << "format ascii 1.0\n";
+  out << "element vertex " << pointcloud.size() << "\n";
+  out << "property float x\n";
+  out << "property float y\n";
+  out << "property float z\n";
+  out << "property uchar red\n";
+  out << "property uchar green\n";
+  out << "property uchar blue\n";
+  out << "end_header\n";
 
-  // std::ofstream out("_pointcloud.ply");
+  for (const auto &point : pointcloud) {
+    out << point[0] << " " << point[1] << " " << point[2] << " " << point[5]
+        << " " << point[4] << " " << point[3] << "\n";
+  }
 
-  // // 1. Write the PLY file header (Geometry + Blue Color)
-  // out << "ply\n";
-  // out << "format ascii 1.0\n";
-  // out << "element vertex " << point_cloud.size() << "\n";
-  // out << "property float x\n";
-  // out << "property float y\n";
-  // out << "property float z\n";
-  // out << "property uchar red\n";
-  // out << "property uchar green\n";
-  // out << "property uchar blue\n";
-  // out << "end_header\n";
-
-  // // 2. Write the X, Y, Z coordinates and RGB values
-  // for (const auto &p : point_cloud) {
-  //   int color = static_cast<int>(p[3]);
-  //   if (p[2] >= 50)
-  //     continue;
-  //   out << p[0] << " " << p[1] << " " << p[2] << " " << color << " " << color
-  //   << " " << color << "\n";
-  // };
-
-  // out.close();
-  // std::cout << "Done exporting point cloud" << std::endl;
+  std::cout << "done saving it succesfully..." << std::endl;
 
   return 0;
 }
+
+// Notes: about the reinterpret_cast<float*> that cpp is not smart about auto
+// conversion note: cv doesn't do broadcasting for casting Vec3b from grayscale
+// image, WE GET A ROW POINTER WE SHOUDL KNOW WHAT WE ARE DOING!!
