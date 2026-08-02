@@ -1,5 +1,6 @@
 #include <Eigen/Eigen>
 #include <Eigen/Geometry>
+#include <charconv>
 #include <chrono>
 #include <fstream>
 #include <iostream>
@@ -9,6 +10,7 @@
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/opencv.hpp>
 #include <ostream>
+#include <ratio>
 #include <sophus/se3.hpp>
 #include <sophus/so3.hpp>
 #include <sstream>
@@ -30,20 +32,34 @@ int main() {
   std::string line;
   std::getline(pose_stream, line);
 
-  std::vector<Sophus::SE3d> pose_vec;
   // performance_try: count lines first and reserve required amount in advanced
   // performance_try: dont' allocate quaternion and vector3d t, just put them
   // directly performance_try: use push_back instead of embrace_back
 
-  std::vector<double> temp_pose_vec(7);
+  auto t1 = std::chrono::steady_clock::now();
+  std::vector<Sophus::SE3d> pose_vec;
+  std::array<double, 7> temp_pose_vec;
 
+  std::getline(pose_stream, line);
   while (std::getline(pose_stream, line)) {
-    std::stringstream streamed_str(line);
-    std::string val;
+    if (line.empty())
+      continue;
+    const char *ptr = line.data();
+    const char *end = line.data() + line.size();
 
-    int i = -1;
-    while (std::getline(streamed_str, val, ' '))
-      temp_pose_vec[++i] = std::stod(val);
+    for (int i = 0; i < 7; ++i) {
+      while (ptr < end && (*ptr == ' ' || *ptr == ','))
+        ++ptr;
+
+      auto [next_ptr, ec] = std::from_chars(ptr, end, temp_pose_vec[i]);
+
+      if (ec != std::errc{}) {
+        std::cerr << "error occured while parsing file.."
+                  << std::make_error_code(ec).message() << std::endl;
+        return 1;
+      }
+      ptr = next_ptr;
+    }
 
     const Eigen::Quaternion q(temp_pose_vec[6], temp_pose_vec[3],
                               temp_pose_vec[4], temp_pose_vec[5]);
@@ -51,7 +67,11 @@ int main() {
                             temp_pose_vec[2]);
     pose_vec.emplace_back(q, t);
   }
+  auto t2 = std::chrono::steady_clock::now();
+  std::cout << "1. time took to create the pose: "
+            << std::chrono::duration<double, std::milli>(t2 - t1) << std::endl;
 
+  // ====reading the images====
   std::vector<cv::Mat> rgb_images;
   std::vector<cv::Mat> depth_images;
 
@@ -70,15 +90,14 @@ int main() {
   double fx = 518.0;
   double fy = 519.0;
 
-  // todo performance try reserving in advanced cols * rows * N_IMAGES
+  t1 = std::chrono::steady_clock::now();
   std::vector<Eigen::Matrix<double, 6, 1>> pointcloud;
+  pointcloud.reserve(rgb_images[0].cols * rgb_images[0].rows * N_IMAGES);
 
   for (size_t i = 0; i < N_IMAGES; ++i) {
     const auto depth_img = depth_images[i];
     const auto rgb_img = rgb_images[i];
 
-    // todo performace try not allocating the row ptr
-    // tood perforamnce try allocate matrix and move it instead of emblace
     for (size_t v = 0; v < rgb_img.rows; ++v) {
       const cv::Vec3b *row_ptr = rgb_img.ptr<cv::Vec3b>(v);
       const ushort *depth_row = depth_img.ptr<ushort>(v);
@@ -91,7 +110,8 @@ int main() {
         double X_cam = Z_cam * (u - cx) / fx;
         double Y_cam = Z_cam * (v - cy) / fy;
         Eigen::Vector3d p_cam(X_cam, Y_cam, Z_cam);
-        Eigen::Vector3d p_world = pose_vec[i] * p_cam;
+        // Eigen::Vector3d p_world = pose_vec[i] * p_cam;
+        Eigen::Vector3d p_world = p_cam;
 
         pointcloud.emplace_back(p_world[0], p_world[1], p_world[2],
                                 row_ptr[u][0], row_ptr[u][1], row_ptr[u][2]);
@@ -100,15 +120,18 @@ int main() {
   }
 
   // Save PLY format
+  t1 = std::chrono::steady_clock::now();
   std::cout << "Starting exporting PLY format..." << std::endl;
-  std::ofstream out(data_path + "/created/pointcloud_rgbd.ply");
+
+  std::ofstream out(data_path + "/created/pointcloud_rgbd.ply",
+                    std::ios::binary);
   if (!out.is_open()) {
     std::cerr << "failed to open .ply file to write pointcloud" << std::endl;
     return 1;
   }
 
   out << "ply\n";
-  out << "format ascii 1.0\n";
+  out << "format binary_little_endian 1.0\n";
   out << "element vertex " << pointcloud.size() << "\n";
   out << "property float x\n";
   out << "property float y\n";
@@ -119,15 +142,22 @@ int main() {
   out << "end_header\n";
 
   for (const auto &point : pointcloud) {
-    out << point[0] << " " << point[1] << " " << point[2] << " " << point[5]
-        << " " << point[4] << " " << point[3] << "\n";
+    // 1. Cast the 64-bit doubles down to 32-bit floats
+    float xyz[3] = {static_cast<float>(point[0]), static_cast<float>(point[1]),
+                    static_cast<float>(point[2])};
+
+    // 2. Cast the colors to 8-bit unsigned chars, reordering BGR to RGB
+    uint8_t rgb[3] = {static_cast<uint8_t>(point[5]),
+                      static_cast<uint8_t>(point[4]),
+                      static_cast<uint8_t>(point[3])};
+
+    // 3. Dump the raw memory bytes straight to the file buffer
+    out.write(reinterpret_cast<const char *>(xyz), sizeof(xyz));
+    out.write(reinterpret_cast<const char *>(rgb), sizeof(rgb));
   }
 
-  std::cout << "done saving it succesfully..." << std::endl;
+  t2 = std::chrono::steady_clock::now();
+  std::cout << "done saving it succesfully... took: " << std::chrono::duration<double, std::milli>(t2 - t1)  << std::endl;
 
   return 0;
 }
-
-// Notes: about the reinterpret_cast<float*> that cpp is not smart about auto
-// conversion note: cv doesn't do broadcasting for casting Vec3b from grayscale
-// image, WE GET A ROW POINTER WE SHOUDL KNOW WHAT WE ARE DOING!!
